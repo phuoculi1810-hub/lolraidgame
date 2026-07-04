@@ -64,6 +64,21 @@ app.get('/get_cooldown', (req, res) => {
     res.json({ remaining_seconds: remaining });
 });
 
+// Update status
+app.post('/update_status', (req, res) => {
+    const { username, status } = req.body;
+    if (!username || typeof status !== 'string') {
+        return res.status(400).json({ error: "Invalid parameters" });
+    }
+    if (!db[username]) {
+        db[username] = { expire_timestamp: 0, status: "Unknown" };
+    }
+    db[username].status = status;
+    saveDb();
+    console.log(`[*] Status for ${username} updated: ${status}`);
+    res.json({ success: true });
+});
+
 // Dashboard
 app.get('/', (req, res) => {
     let html = `
@@ -109,13 +124,14 @@ app.get('/', (req, res) => {
         accounts.forEach(username => {
             const user_data = db[username];
             const remaining = user_data.expire_timestamp - now;
+            let displayStatus = user_data.status || "Chưa có trạng thái";
             
             if (remaining <= 0) {
                 // Sẵn sàng
                 html += `
                 <tr>
                     <td>${username}</td>
-                    <td class="ready">Sẵn Sàng Raid</td>
+                    <td class="ready">${displayStatus}</td>
                     <td class="time">00:00:00</td>
                     <td>-</td>
                 </tr>`;
@@ -130,7 +146,7 @@ app.get('/', (req, res) => {
                 html += `
                 <tr>
                     <td>${username}</td>
-                    <td class="cooldown">Đang Cooldown</td>
+                    <td class="cooldown">${displayStatus}</td>
                     <td class="time">${timeString}</td>
                     <td>${expireDate}</td>
                 </tr>`;
