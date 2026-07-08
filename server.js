@@ -547,9 +547,9 @@ app.get("/dashboard", (req, res) => {
       const raw = document.getElementById("jobInput").value.trim();
       if (!raw) return showToast("❌ Chưa nhập JobID!", true);
 
-      const servers = raw.split("\\n")
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
+        const servers = raw.split("\\n")
+          .map(s => s.trim())
+          .filter(s => s.length > 0);
 
       if (servers.length === 0) return showToast("❌ Không có JobID hợp lệ!", true);
 
@@ -678,8 +678,8 @@ app.get("/dashboard", (req, res) => {
           + '<div class="items">' + itemsText + '</div>'
           + '<div class="jobid">JobID: ' + escapeHtml(ev.jobId) + '</div>'
           + '<div class="mini-actions">'
-          +   '<button onclick="copyJobId(\'' + ev.id + '\')">📋 Copy JobID</button>'
-          +   '<button onclick="copyScript(\'' + ev.id + '\')">📋 Copy Script Join</button>'
+          +   '<button onclick="copyJobId(\\'' + ev.id + '\\')">📋 Copy JobID</button>'
+          +   '<button onclick="copyScript(\\'' + ev.id + '\\')">📋 Copy Script Join</button>'
           + '</div>'
           + '</div>';
       }
