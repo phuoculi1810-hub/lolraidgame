@@ -426,6 +426,8 @@ app.get("/dashboard", (req, res) => {
     }
     .alert-banner .btn-view { background: #fff; color: #c0392b; }
     .alert-banner .btn-copy { background: rgba(255,255,255,0.2); color: #fff; }
+    .alert-banner .btn-mute { background: rgba(255,255,255,0.2); color: #fff; }
+    .alert-banner .btn-mute.active { background: #222; color: #ffd166; }
     @keyframes pulse {
       0%, 100% { background: #c0392b; }
       50%      { background: #e74c3c; }
@@ -461,6 +463,7 @@ app.get("/dashboard", (req, res) => {
     <div class="body" id="alertBody"></div>
     <div class="actions">
       <button class="btn-view" onclick="dismissAlert()">👁️ Xem (tắt chuông)</button>
+      <button class="btn-mute" id="muteBtn" onclick="toggleMute()">🔇 Tắt tiếng</button>
       <button class="btn-copy" onclick="copyText(currentAlert && currentAlert.jobId)">📋 Copy JobID</button>
       <button class="btn-copy" onclick="copyText(currentAlert && currentAlert.joinScript)">📋 Copy Script Join</button>
     </div>
@@ -635,6 +638,7 @@ app.get("/dashboard", (req, res) => {
     let currentAlert   = null;
     let audioCtx       = null;
     let alarmTimer     = null;
+    let isMuted        = false; // tắt tiếng chuông, không ảnh hưởng tới banner/queue
 
     function escapeHtml(s) {
       return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -705,6 +709,7 @@ app.get("/dashboard", (req, res) => {
     // ── Chuông cảnh báo (Web Audio, không cần file mp3) ──
     function startAlarm() {
       if (alarmTimer) return;
+      if (isMuted) return; // đang tắt tiếng -> không phát, nhưng banner/queue vẫn giữ nguyên
       audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
       alarmTimer = setInterval(function () {
         try {
@@ -721,6 +726,20 @@ app.get("/dashboard", (req, res) => {
     }
     function stopAlarm() {
       if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; }
+    }
+    function toggleMute() {
+      isMuted = !isMuted;
+      const btn = document.getElementById("muteBtn");
+      if (isMuted) {
+        stopAlarm();
+        if (btn) { btn.textContent = "🔔 Bật tiếng"; btn.classList.add("active"); }
+        showToast("🔇 Đã tắt tiếng chuông (banner vẫn hiện khi có khớp target)");
+      } else {
+        if (btn) { btn.textContent = "🔇 Tắt tiếng"; btn.classList.remove("active"); }
+        // nếu vẫn còn cảnh báo chưa xem thì kêu lại ngay
+        if (currentAlert || alertQueue.length > 0) startAlarm();
+        showToast("🔔 Đã bật lại tiếng chuông");
+      }
     }
 
     function showAlert(ev) {
