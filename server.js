@@ -873,10 +873,14 @@ app.post("/scan", apiAuth, (req, res) => {
   // Chỉ xét mặt hàng có giá Yên (bỏ qua mặt hàng chỉ bán bằng AC Coin)
   const yenItems = items.filter((it) => it && it.yen && String(it.yen).trim() !== "");
 
-  // Khớp với danh sách target (không phân biệt hoa/thường)
+  // Khớp với danh sách target (không phân biệt hoa/thường) — VÀ phải còn hàng
+  // (quantity > 0), vì số lượng 0 nghĩa là đã hết hàng, không đáng báo động.
   const matched = targetItems.length === 0
     ? []
-    : yenItems.filter((it) => targetItems.includes(String(it.name || "").trim().toLowerCase()));
+    : yenItems.filter((it) =>
+        targetItems.includes(String(it.name || "").trim().toLowerCase()) &&
+        Number(it.quantity) > 0
+      );
 
   console.log(`[SCAN] jobId=${jobId} items=${items.length} yen=${yenItems.length} matched=${matched.length}`);
 
