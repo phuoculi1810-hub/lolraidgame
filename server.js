@@ -59,6 +59,82 @@ let scanLog = [];
 
 console.log(`📂 [LOAD] servers=${serverList.length} targets=${targetItems.length}`);
 
+// ════════════════════════════════════════════════════════════════════════════
+// 🕵️ LESTER HUB — Player/Gang Finder + Rift/Boss Timer
+// Toàn bộ phần dưới đây là 1 hệ thống HOÀN TOÀN TÁCH BIỆT khỏi Merchant
+// Scanner ở trên: state riêng, file lưu riêng (lester-data.json), route riêng
+// (tiền tố /lester/...), dashboard riêng (/lester-dashboard). Không đụng tới
+// biến, file data.json hay route nào của hệ thống cũ.
+// ════════════════════════════════════════════════════════════════════════════
+const LESTER_DATA_FILE = path.join(DATA_DIR, "lester-data.json");
+
+function loadLesterData() {
+  try {
+    if (fs.existsSync(LESTER_DATA_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(LESTER_DATA_FILE, "utf8"));
+      return {
+        targetPlayers: Array.isArray(parsed.targetPlayers) ? parsed.targetPlayers : [],
+      };
+    }
+  } catch (err) {
+    console.error("❌ [LESTER LOAD] Lỗi đọc lester-data.json:", err.message);
+  }
+  return { targetPlayers: [] };
+}
+
+function saveLesterData() {
+  try {
+    fs.writeFileSync(LESTER_DATA_FILE, JSON.stringify({
+      targetPlayers: lesterTargetPlayers,
+    }, null, 2), "utf8");
+    console.log(`💾 [LESTER SAVE] targetPlayers=${lesterTargetPlayers.length}`);
+  } catch (err) {
+    console.error("❌ [LESTER SAVE] Lỗi ghi lester-data.json:", err.message);
+  }
+}
+
+const lesterInit = loadLesterData();
+let lesterTargetPlayers = lesterInit.targetPlayers; // tên player cần theo dõi (lowercase, trimmed)
+// Hàng đợi "ép nhảy tới JobID cụ thể" — dùng chung với vòng hop CỦA game.lua
+// (executeHop() sẽ kiểm tra hàng đợi này TRƯỚC khi gọi /claim như bình thường).
+// Không còn round-robin/full-set riêng cho Lester nữa vì hopping giờ dùng
+// chung engine /claim + /skip đã có sẵn của Merchant Scanner.
+let lesterJoinQueue     = [];
+let lesterServers       = {};         // jobId -> { jobId, gang, ageMinutes, reportedAt, matchedPlayer, matchedGang, updatedAt } (RAM only, dùng nút Clear Data để dọn)
+const lesterSseClients  = new Set();
+
+console.log(`📂 [LESTER LOAD] targetPlayers=${lesterTargetPlayers.length}`);
+
+function lesterBroadcast(event) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of lesterSseClients) {
+    try { client.write(payload); } catch (_) { lesterSseClients.delete(client); }
+  }
+}
+
+// Thời gian hiện tại (phút) của 1 server, tính real-time dựa trên lần report gần nhất
+// VD: report lúc ageMinutes=620 (10h20) lúc 10:00:00, bây giờ là 10:03:30 -> trả về 623.5
+function lesterCurrentMinutes(server) {
+  const base = Number(server.ageMinutes) || 0;
+  const reportedAt = new Date(server.reportedAt).getTime();
+  const elapsedMin = Math.max(0, (Date.now() - reportedAt) / 60000);
+  return base + elapsedMin;
+}
+
+// Kiểm tra 1 mốc thời gian có đang nằm trong khoảng ±10 phút quanh chu kỳ spawn không
+// (rift: chu kỳ 90 phút -> 1h30, 3h00, 4h30...; boss: chu kỳ 120 phút -> 2h00, 4h00...)
+function lesterInWindow(currentMinutes, periodMinutes, windowMinutes) {
+  const remainder = ((currentMinutes % periodMinutes) + periodMinutes) % periodMinutes;
+  return remainder <= windowMinutes || remainder >= (periodMinutes - windowMinutes);
+}
+
+function lesterFmtMinutes(mins) {
+  const total = Math.round(mins);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":00";
+}
+
 function getNextValidIndex() {
   if (serverList.length === 0) return null;
   const activeCount = serverList.filter((id) => !skippedSet.has(id)).length;
@@ -954,6 +1030,523 @@ app.post("/reset", apiAuth, (req, res) => {
   globalCounter = 0;
   skippedSet.clear();
   res.json({ success: true });
+});
+
+function renderLesterDashboard(key) {
+  return `<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lester Hub Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 32px 16px; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; color: #fff; margin-bottom: 6px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 24px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+  .stat { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; padding: 14px; text-align: center; }
+  .stat .num { font-size: 24px; font-weight: 700; color: #e91e8c; }
+  .stat .lbl { font-size: 11px; color: #666; margin-top: 4px; }
+  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 22px; margin-bottom: 18px; }
+  .card h2 { font-size: 15px; color: #fff; margin-bottom: 6px; }
+  .card p { font-size: 12px; color: #666; margin-bottom: 14px; }
+  textarea, input[type=text] {
+    width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
+    color: #e0e0e0; font-size: 13px; font-family: monospace; padding: 10px 12px; outline: none; resize: vertical;
+  }
+  textarea { height: 120px; }
+  textarea:focus, input[type=text]:focus { border-color: #e91e8c; }
+  .actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  button { padding: 9px 18px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: #e91e8c; color: #fff; }
+  .btn-primary:hover { background: #c8177a; }
+  .btn-danger { background: #c0392b; color: #fff; }
+  .btn-danger:hover { background: #a93226; }
+  .btn-secondary { background: #2a2a2a; color: #aaa; border: 1px solid #444; }
+  .btn-secondary:hover { background: #333; }
+  .toast { display: none; position: fixed; bottom: 24px; right: 24px; background: #27ae60; color: #fff;
+    padding: 12px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; box-shadow: 0 4px 16px rgba(0,0,0,0.4); z-index: 999; }
+  .toast.err { background: #c0392b; }
+  .current-list { font-family: monospace; font-size: 12px; color: #888; background: #111; border: 1px solid #222;
+    border-radius: 8px; padding: 12px; max-height: 140px; overflow-y: auto; line-height: 1.8; word-break: break-all; }
+  .alert-banner { display: none; position: sticky; top: 0; z-index: 1000; background: #c0392b; color: #fff;
+    padding: 14px 20px; margin: -32px -16px 20px -16px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); animation: pulse 1s infinite; }
+  .alert-banner .title { font-weight: 700; font-size: 15px; margin-bottom: 6px; }
+  .alert-banner .body { font-size: 13px; opacity: 0.95; margin-bottom: 10px; }
+  .alert-banner .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 0; }
+  .alert-banner button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .alert-banner .btn-view { background: #fff; color: #c0392b; }
+  .alert-banner .btn-copy { background: rgba(255,255,255,0.2); color: #fff; }
+  .alert-banner .btn-mute { background: rgba(255,255,255,0.2); color: #fff; }
+  .alert-banner .btn-mute.active { background: #222; color: #ffd166; }
+  @keyframes pulse { 0%, 100% { background: #c0392b; } 50% { background: #e74c3c; } }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: #888; font-weight: 600; padding: 8px; border-bottom: 1px solid #2a2a2a; font-size: 11px; }
+  td { padding: 8px; border-bottom: 1px solid #1e1e1e; vertical-align: top; }
+  tr.matched td { background: #0f1a12; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 10px; font-weight: 700; }
+  .tag-player { background: #c0392b; color: #fff; }
+  .tag-gang { background: #8e44ad; color: #fff; }
+  .jobid-cell { font-family: monospace; color: #4f8ef7; word-break: break-all; max-width: 200px; }
+  .mini-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .mini-actions button { padding: 4px 8px; font-size: 10px; border: 1px solid #333; background: #1a1a1a; color: #aaa; border-radius: 6px; }
+  .mini-actions button:hover { background: #2a2a2a; }
+  .empty-hint { color: #555; font-size: 12px; text-align: center; padding: 20px; }
+  .search-hint { font-size: 11px; color: #e91e8c; margin-top: 6px; }
+  .back-link { display: inline-block; margin-bottom: 16px; color: #666; font-size: 12px; text-decoration: none; }
+  .back-link:hover { color: #aaa; }
+</style>
+</head>
+<body>
+  <div class="alert-banner" id="alertBanner">
+    <div class="title" id="alertTitle">🚨 PHÁT HIỆN TARGET!</div>
+    <div class="body" id="alertBody"></div>
+    <div class="actions">
+      <button class="btn-view" onclick="dismissAlert()">👁️ Xem (tắt chuông)</button>
+      <button class="btn-mute" id="muteBtn" onclick="toggleMute()">🔇 Tắt tiếng</button>
+      <button class="btn-copy" onclick="copyText(currentAlert && currentAlert.jobId)">📋 Copy JobID</button>
+      <button class="btn-copy" onclick="copyText(currentAlert && currentAlert.joinScript)">📋 Copy Script Join</button>
+      <button class="btn-copy" onclick="clearData()">🧹 Clear Data</button>
+    </div>
+  </div>
+  <div class="container">
+    <a class="back-link" href="/dashboard?key=${key}">← Về Dashboard Merchant (hệ thống cũ)</a>
+    <h1>🕵️ Lester Hub Dashboard</h1>
+    <div class="sub">Player/Gang Finder + Rift/Boss Timer — hệ thống độc lập, không ảnh hưởng Merchant Scanner</div>
+
+    <div class="stats">
+      <div class="stat"><div class="num" id="stat-servers">0</div><div class="lbl">Server đã ghi nhận</div></div>
+      <div class="stat"><div class="num" id="stat-targets">0</div><div class="lbl">Target player</div></div>
+      <div class="stat"><div class="num" id="stat-matched" style="color:#e74c3c">0</div><div class="lbl">Đang khớp target</div></div>
+    </div>
+
+    <div class="card">
+      <h2>🎯 Target Player cần theo dõi</h2>
+      <p>Mỗi dòng 1 username (không phân biệt hoa/thường). Khi quét thấy player này trong server, chuông sẽ kêu liên tục tới khi bấm "Xem" hoặc "Clear Data".</p>
+      <textarea id="targetInput" placeholder="Mỗi dòng 1 username&#10;Ví dụ:&#10;Ro_Ghoul211&#10;BigTuum"></textarea>
+      <div class="actions">
+        <button class="btn-primary" onclick="saveTargets()">💾 Lưu target</button>
+        <button class="btn-secondary" onclick="loadTargetsView()">📋 Xem hiện tại</button>
+      </div>
+      <div class="current-list" id="targetList" style="margin-top:12px;display:none"></div>
+    </div>
+
+    <div class="card">
+      <h2>➡️ Ép bot nhảy tới JobID cụ thể</h2>
+      <p>Bot merchant (game.lua) sẽ kiểm tra hàng đợi này TRƯỚC MỖI lần hop bình thường — có jobId ở đây thì nhảy thẳng tới đó thay vì tự claim ngẫu nhiên. Dùng khi thấy 1 server ngon trong bảng dưới (rift sắp ra, có target...) và muốn điều bot tới ngay.</p>
+      <input type="text" id="joinInput" placeholder="Dán JobID cần join...">
+      <div class="actions">
+        <button class="btn-primary" onclick="queueJoin()">📤 Gửi lệnh</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📡 Dữ liệu quét <span id="connStatus" style="font-size:11px;color:#666">(đang kết nối...)</span></h2>
+      <p>Quét lại cùng JobID sẽ tự động cập nhật bản ghi cũ. Gõ <strong style="color:#e91e8c">/rift</strong> hoặc <strong style="color:#e91e8c">/boss</strong> vào ô tìm kiếm để lọc server sắp/vừa có Rift hoặc Boss (±10 phút quanh mốc spawn).</p>
+      <input type="text" id="searchInput" placeholder="Tìm theo JobID / Gang, hoặc gõ /rift, /boss..." oninput="onSearchInput()">
+      <div class="search-hint" id="searchHint" style="display:none"></div>
+      <div class="actions" style="margin-top:14px">
+        <button class="btn-danger" onclick="clearData()">🧹 Clear Data</button>
+        <button class="btn-secondary" onclick="loadDataLog()">🔄 Tải lại</button>
+      </div>
+      <div style="overflow-x:auto; margin-top:14px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Trạng thái</th>
+              <th>JobID</th>
+              <th>Gang chiếm server</th>
+              <th>Thời gian server (real-time)</th>
+              <th>Cập nhật</th>
+              <th>Hành động</th>
+            </tr>
+          </thead>
+          <tbody id="dataBody"></tbody>
+        </table>
+        <div class="empty-hint" id="emptyHint">Chưa có dữ liệu nào được quét...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const KEY = "${key}";
+    let servers = {};        // jobId -> server object (cache tại client)
+    let searchMode = null;   // null | 'rift' | 'boss'
+    let alertQueue = [];
+    let currentAlert = null;
+    let audioCtx = null;
+    let alarmTimer = null;
+    let isMuted = false;
+
+    function showToast(msg, isErr) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "toast" + (isErr ? " err" : "");
+      t.style.display = "block";
+      setTimeout(() => t.style.display = "none", 3000);
+    }
+    function escapeHtml(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    }
+    function copyText(text, label) {
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(
+        () => showToast("✅ Đã copy " + (label || "") + "!"),
+        () => showToast("❌ Copy thất bại", true)
+      );
+    }
+
+    // ── Target players ──
+    async function saveTargets() {
+      const raw = document.getElementById("targetInput").value.trim();
+      const targets = raw.split("\\n").map(s => s.trim()).filter(Boolean);
+      const res = await fetch("/lester/targets", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Api-Key": KEY },
+        body: JSON.stringify({ targets })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("✅ Đã lưu " + data.total + " target player!");
+        document.getElementById("stat-targets").textContent = data.total;
+        document.getElementById("targetInput").value = "";
+      } else showToast("❌ " + (data.error || "Lỗi"), true);
+    }
+    async function loadTargetsView() {
+      const res = await fetch("/lester/targets?key=" + KEY);
+      const data = await res.json();
+      const el = document.getElementById("targetList");
+      el.style.display = "block";
+      el.innerHTML = data.targets.map((n,i) => \`<span style="color:#555">\${i+1}.</span> \${escapeHtml(n)}\`).join("<br>") || "<em>Chưa có target</em>";
+      document.getElementById("stat-targets").textContent = data.total;
+    }
+
+    // ── Join thủ công ──
+    async function queueJoin() {
+      const jobId = document.getElementById("joinInput").value.trim();
+      if (!jobId) return showToast("❌ Chưa nhập JobID!", true);
+      const res = await fetch("/lester/join", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Api-Key": KEY },
+        body: JSON.stringify({ jobId })
+      });
+      if (res.ok) { showToast("✅ Đã gửi lệnh join!"); document.getElementById("joinInput").value = ""; }
+      else showToast("❌ Gửi thất bại", true);
+    }
+
+    // ── Data log + realtime render ──
+    function fmtRealtime(server) {
+      const base = Number(server.ageMinutes) || 0;
+      const reportedAt = new Date(server.reportedAt).getTime();
+      const elapsedMin = Math.max(0, (Date.now() - reportedAt) / 60000);
+      const total = Math.round(base + elapsedMin);
+      const h = Math.floor(total / 60), m = total % 60;
+      return String(h).padStart(2,"0") + ":" + String(m).padStart(2,"0") + ":00";
+    }
+
+    function renderTable(list) {
+      const body = document.getElementById("dataBody");
+      const emptyHint = document.getElementById("emptyHint");
+      if (!list || list.length === 0) {
+        body.innerHTML = "";
+        emptyHint.style.display = "block";
+        return;
+      }
+      emptyHint.style.display = "none";
+      let matchedCount = 0;
+      body.innerHTML = list.map(s => {
+        const isMatched = !!(s.matchedPlayer || s.matchedGang);
+        if (isMatched) matchedCount++;
+        let tags = "";
+        if (s.matchedPlayer) tags += '<span class="tag tag-player">👤 ' + escapeHtml(s.matchedPlayer) + '</span> ';
+        if (s.matchedGang)   tags += '<span class="tag tag-gang">🏴 ' + escapeHtml(s.matchedGang) + '</span>';
+        if (!tags) tags = '<span style="color:#555">—</span>';
+        const timeDisplay = s.currentAgeStr ? s.currentAgeStr : fmtRealtime(s);
+        return '<tr class="' + (isMatched ? "matched" : "") + '" data-jobid="' + escapeHtml(s.jobId) + '">'
+          + '<td>' + tags + '</td>'
+          + '<td class="jobid-cell">' + escapeHtml(s.jobId) + '</td>'
+          + '<td>' + escapeHtml(s.gang || "—") + '</td>'
+          + '<td class="realtime-cell" data-base="' + (Number(s.ageMinutes)||0) + '" data-reported="' + s.reportedAt + '">' + timeDisplay + '</td>'
+          + '<td>' + new Date(s.updatedAt || s.reportedAt).toLocaleTimeString("vi-VN") + '</td>'
+          + '<td class="mini-actions">'
+          +   '<button onclick="copyText(\\'' + s.jobId + '\\',\\'JobID\\')">📋 JobID</button>'
+          +   '<button onclick="copyText(' + JSON.stringify(s.joinScript || "") + ',\\'Script Join\\')">📋 Script</button>'
+          + '</td></tr>';
+      }).join("");
+      document.getElementById("stat-matched").textContent = matchedCount;
+    }
+
+    // Tick realtime mỗi giây (không cần gọi lại server, chỉ tính lại từ base+reportedAt)
+    setInterval(() => {
+      if (searchMode) return; // đang ở chế độ search rift/boss thì để nguyên số liệu server trả
+      document.querySelectorAll(".realtime-cell").forEach(cell => {
+        const base = Number(cell.getAttribute("data-base")) || 0;
+        const reportedAt = new Date(cell.getAttribute("data-reported")).getTime();
+        const elapsedMin = Math.max(0, (Date.now() - reportedAt) / 60000);
+        const total = Math.round(base + elapsedMin);
+        const h = Math.floor(total/60), m = total % 60;
+        cell.textContent = String(h).padStart(2,"0") + ":" + String(m).padStart(2,"0") + ":00";
+      });
+    }, 1000);
+
+    async function loadDataLog() {
+      try {
+        const res = await fetch("/lester/data?key=" + KEY);
+        const data = await res.json();
+        servers = {};
+        (data.servers || []).forEach(s => servers[s.jobId] = s);
+        document.getElementById("stat-servers").textContent = data.total;
+        applyFilter();
+      } catch (e) {
+        showToast("❌ Lỗi tải dữ liệu", true);
+      }
+    }
+
+    async function clearData() {
+      if (!confirm("Xóa toàn bộ dữ liệu quét đã nhận về? (không ảnh hưởng target/hàng đợi join)")) return;
+      const res = await fetch("/lester/data/clear", { method: "POST", headers: { "X-Api-Key": KEY } });
+      if (res.ok) {
+        servers = {};
+        renderTable([]);
+        document.getElementById("stat-servers").textContent = 0;
+        document.getElementById("stat-matched").textContent = 0;
+        alertQueue = [];
+        advanceAlert();
+        showToast("✅ Đã xóa dữ liệu quét!");
+      } else showToast("❌ Xóa thất bại", true);
+    }
+
+    function applyFilter() {
+      const list = Object.values(servers).sort((a,b) => new Date(b.updatedAt||b.reportedAt) - new Date(a.updatedAt||a.reportedAt));
+      const q = document.getElementById("searchInput").value.trim().toLowerCase();
+      if (!q) { renderTable(list); return; }
+      const filtered = list.filter(s =>
+        (s.jobId || "").toLowerCase().includes(q) || (s.gang || "").toLowerCase().includes(q)
+      );
+      renderTable(filtered);
+    }
+
+    let searchDebounce = null;
+    function onSearchInput() {
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(async () => {
+        const q = document.getElementById("searchInput").value.trim().toLowerCase();
+        const hint = document.getElementById("searchHint");
+        if (q === "/rift" || q === "/boss") {
+          searchMode = q === "/rift" ? "rift" : "boss";
+          const res = await fetch("/lester/search?type=" + searchMode + "&key=" + KEY);
+          const data = await res.json();
+          hint.style.display = "block";
+          hint.textContent = "🔍 Đang lọc server có " + (searchMode === "rift" ? "Rift (chu kỳ 90 phút)" : "Boss (chu kỳ 120 phút)") + " sắp/vừa xuất hiện — tìm thấy " + data.total + " server.";
+          renderTable(data.matches.map(s => ({ ...s, currentAgeStr: s.currentAgeStr })));
+        } else {
+          searchMode = null;
+          hint.style.display = "none";
+          applyFilter();
+        }
+      }, 150);
+    }
+
+    // ── Chuông cảnh báo ──
+    function startAlarm() {
+      if (alarmTimer || isMuted) return;
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      alarmTimer = setInterval(() => {
+        try {
+          const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+          osc.frequency.value = 1046;
+          osc.connect(gain); gain.connect(audioCtx.destination);
+          gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+          osc.start(); osc.stop(audioCtx.currentTime + 0.25);
+        } catch (e) {}
+      }, 700);
+    }
+    function stopAlarm() { if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; } }
+    function toggleMute() {
+      isMuted = !isMuted;
+      const btn = document.getElementById("muteBtn");
+      if (isMuted) { stopAlarm(); btn.textContent = "🔔 Bật tiếng"; btn.classList.add("active"); showToast("🔇 Đã tắt tiếng chuông"); }
+      else { btn.textContent = "🔇 Tắt tiếng"; btn.classList.remove("active"); if (currentAlert || alertQueue.length) startAlarm(); showToast("🔔 Đã bật lại tiếng chuông"); }
+    }
+    function showAlert(server, findType) {
+      alertQueue.push({ server, findType });
+      if (!currentAlert) advanceAlert();
+      startAlarm();
+    }
+    function advanceAlert() {
+      const next = alertQueue.shift();
+      currentAlert = next ? next.server : null;
+      const banner = document.getElementById("alertBanner");
+      if (!currentAlert) { banner.style.display = "none"; stopAlarm(); return; }
+      const label = currentAlert.matchedPlayer ? "👤 " + currentAlert.matchedPlayer : "🏴 " + currentAlert.matchedGang;
+      document.getElementById("alertTitle").textContent = "🚨 PHÁT HIỆN TARGET: " + label;
+      document.getElementById("alertBody").textContent = "JobID: " + currentAlert.jobId + (alertQueue.length ? " — còn " + alertQueue.length + " cảnh báo khác đang chờ" : "");
+      banner.style.display = "block";
+    }
+    function dismissAlert() { advanceAlert(); }
+
+    function connectEvents() {
+      const status = document.getElementById("connStatus");
+      const es = new EventSource("/lester/events?key=" + KEY);
+      es.onopen = () => { status.textContent = "(đã kết nối)"; status.style.color = "#27ae60"; };
+      es.onerror = () => { status.textContent = "(mất kết nối, đang thử lại...)"; status.style.color = "#e67e22"; };
+      es.onmessage = (e) => {
+        let ev;
+        try { ev = JSON.parse(e.data); } catch (err) { return; }
+        if (!ev.server) return;
+        servers[ev.server.jobId] = ev.server;
+        document.getElementById("stat-servers").textContent = Object.keys(servers).length;
+        if (!searchMode) applyFilter();
+        if (ev.type === "find") showAlert(ev.server, ev.findType);
+      };
+    }
+
+    loadTargetsView();
+    loadDataLog();
+    connectEvents();
+  </script>
+</body>
+</html>`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🕵️ LESTER HUB — API routes (namespace /lester/... — tách biệt hoàn toàn)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Dashboard riêng — dùng chung mật khẩu/API_KEY với hệ thống cũ nhưng là trang khác
+app.get("/lester-dashboard", (req, res) => {
+  const key = req.query.key;
+  if (key !== API_KEY) return res.redirect("/?err=1");
+  res.send(renderLesterDashboard(key));
+});
+
+// ─── Target player cần theo dõi ──────────────────────────────────────────────
+app.get("/lester/targets", apiAuth, (req, res) => {
+  res.json({ targets: lesterTargetPlayers, total: lesterTargetPlayers.length });
+});
+
+app.post("/lester/targets", apiAuth, (req, res) => {
+  const { targets } = req.body;
+  if (!Array.isArray(targets)) {
+    return res.status(400).json({ error: 'Body phải có dạng: { "targets": [...] }' });
+  }
+  lesterTargetPlayers = [...new Set(targets.map((t) => String(t).trim().toLowerCase()).filter(Boolean))];
+  saveLesterData();
+  res.json({ success: true, total: lesterTargetPlayers.length, targets: lesterTargetPlayers });
+});
+
+// ─── Hàng đợi "ép nhảy tới JobID cụ thể" ─────────────────────────────────────
+// game.lua (bot merchant) sẽ kiểm tra hàng đợi này TRƯỚC MỖI lần hop bình
+// thường (executeHop). Nếu có jobId trong hàng đợi -> nhảy thẳng tới đó thay
+// vì gọi /claim như thường lệ. Dùng khi bạn thấy 1 server ngon (rift sắp ra,
+// có target...) trong bảng dữ liệu và muốn điều bot merchant tới đó ngay.
+app.get("/lester/join", apiAuth, (req, res) => {
+  const jobId = lesterJoinQueue.shift();
+  res.type("text/plain").send(jobId || "NONE");
+});
+
+app.post("/lester/join", apiAuth, (req, res) => {
+  const { jobId } = req.body;
+  if (!jobId) return res.status(400).json({ error: "Thiếu jobId" });
+  lesterJoinQueue.push(String(jobId).trim());
+  res.json({ success: true, queued: jobId, queueLength: lesterJoinQueue.length });
+});
+
+// ─── Báo cáo dữ liệu quét mỗi server (jobId, tuổi server, gang đang chiếm) ───
+// Quét lại cùng 1 jobId sẽ CẬP NHẬT record cũ (upsert theo jobId) chứ không tạo bản ghi mới.
+app.post("/lester/report", apiAuth, (req, res) => {
+  const { jobId, ageMinutes, gang } = req.body;
+  if (!jobId || typeof ageMinutes !== "number") {
+    return res.status(400).json({ error: 'Body phải có dạng: { jobId, ageMinutes, gang? }' });
+  }
+  const now = new Date().toISOString();
+  const existing = lesterServers[jobId] || {};
+  lesterServers[jobId] = {
+    ...existing,
+    jobId,
+    ageMinutes,
+    reportedAt: now,
+    updatedAt: now,
+    gang: (gang !== undefined && gang !== null && gang !== "") ? gang : (existing.gang || null),
+    matchedPlayer: existing.matchedPlayer || null,
+    matchedGang: existing.matchedGang || null,
+    joinScript: buildJoinScript(jobId),
+  };
+  console.log(`[LESTER REPORT] jobId=${jobId} age=${lesterFmtMinutes(ageMinutes)} gang=${gang || "-"}`);
+  lesterBroadcast({ type: "report", server: lesterServers[jobId] });
+  res.json({ success: true });
+});
+
+// ─── Báo cáo khớp target (player hoặc gang) -> dashboard sẽ rung chuông ─────
+app.post("/lester/report-find", apiAuth, (req, res) => {
+  const { type, name, jobId } = req.body;
+  if (!jobId || !type || !name) {
+    return res.status(400).json({ error: 'Body phải có dạng: { type: "player"|"gang", name, jobId }' });
+  }
+  const now = new Date().toISOString();
+  const existing = lesterServers[jobId] || { jobId, ageMinutes: 0, reportedAt: now, joinScript: buildJoinScript(jobId) };
+  if (type === "player") existing.matchedPlayer = name;
+  if (type === "gang")   { existing.matchedGang = name; existing.gang = name; }
+  existing.updatedAt = now;
+  lesterServers[jobId] = existing;
+  console.log(`[LESTER FIND] ${type} "${name}" @ ${jobId}`);
+  lesterBroadcast({ type: "find", findType: type, server: existing });
+  res.json({ success: true });
+});
+
+// ─── SSE stream riêng cho Lester dashboard ───────────────────────────────────
+app.get("/lester/events", apiAuth, (req, res) => {
+  res.set({
+    "Content-Type":  "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection":    "keep-alive",
+  });
+  res.flushHeaders();
+  res.write("retry: 3000\n\n");
+  lesterSseClients.add(res);
+  req.on("close", () => lesterSseClients.delete(res));
+});
+
+// ─── Toàn bộ dữ liệu hiện có (cho dashboard load lại khi mở trang / F5) ─────
+app.get("/lester/data", apiAuth, (req, res) => {
+  const list = Object.values(lesterServers).sort((a, b) =>
+    new Date(b.updatedAt || b.reportedAt) - new Date(a.updatedAt || a.reportedAt)
+  );
+  res.json({ servers: list, total: list.length });
+});
+
+app.post("/lester/data/clear", apiAuth, (req, res) => {
+  const count = Object.keys(lesterServers).length;
+  lesterServers = {};
+  console.log(`🧹 [LESTER CLEAR] Đã dọn ${count} bản ghi`);
+  res.json({ success: true, cleared: count });
+});
+
+// ─── Tìm server có Rift/Boss sắp/vừa xuất hiện ──────────────────────────────
+// type=rift  -> chu kỳ 90 phút  (1h30, 3h00, 4h30, 6h00...)
+// type=boss  -> chu kỳ 120 phút (2h00, 4h00, 6h00...)
+// Trả về các server đang trong khoảng ±10 phút quanh mốc spawn, tính real-time
+// dựa trên lần report gần nhất (không cần Lua báo lại liên tục).
+app.get("/lester/search", apiAuth, (req, res) => {
+  const type = String(req.query.type || "").toLowerCase();
+  const period = type === "rift" ? 90 : type === "boss" ? 120 : null;
+  if (!period) return res.status(400).json({ error: "type phải là 'rift' hoặc 'boss'" });
+
+  const matches = Object.values(lesterServers)
+    .map((s) => {
+      const cur = lesterCurrentMinutes(s);
+      return { ...s, currentMinutes: cur, currentAgeStr: lesterFmtMinutes(cur) };
+    })
+    .filter((s) => lesterInWindow(s.currentMinutes, period, 10))
+    .sort((a, b) => {
+      const remA = Math.min(a.currentMinutes % period, period - (a.currentMinutes % period));
+      const remB = Math.min(b.currentMinutes % period, period - (b.currentMinutes % period));
+      return remA - remB;
+    });
+
+  res.json({ type, period, matches, total: matches.length });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
