@@ -1089,6 +1089,8 @@ function renderLesterDashboard(key) {
   .tag { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 10px; font-weight: 700; }
   .tag-player { background: #c0392b; color: #fff; }
   .tag-gang { background: #8e44ad; color: #fff; }
+  .tag-boss-super { background: #e74c3c; color: #fff; }
+  .tag-boss-normal { background: #d35400; color: #fff; }
   .jobid-cell { font-family: monospace; color: #4f8ef7; word-break: break-all; max-width: 200px; }
   .mini-actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .mini-actions button { padding: 4px 8px; font-size: 10px; border: 1px solid #333; background: #1a1a1a; color: #aaa; border-radius: 6px; }
@@ -1144,8 +1146,8 @@ function renderLesterDashboard(key) {
 
     <div class="card">
       <h2>📡 Dữ liệu quét <span id="connStatus" style="font-size:11px;color:#666">(đang kết nối...)</span></h2>
-      <p>Quét lại cùng JobID sẽ tự động cập nhật bản ghi cũ. Gõ <strong style="color:#e91e8c">/rift</strong> hoặc <strong style="color:#e91e8c">/boss</strong> vào ô tìm kiếm để lọc server sắp/vừa có Rift hoặc Boss (±10 phút quanh mốc spawn).</p>
-      <input type="text" id="searchInput" placeholder="Tìm theo JobID / Gang, hoặc gõ /rift, /boss..." oninput="onSearchInput()">
+      <p>Quét lại cùng JobID sẽ tự động cập nhật bản ghi cũ. Gõ <strong style="color:#e91e8c">/rift</strong> hoặc <strong style="color:#e91e8c">/boss</strong> vào ô tìm kiếm để lọc server sắp/vừa có Rift hoặc Boss theo chu kỳ thời gian (±10 phút quanh mốc spawn); gõ tên boss (VD: Zun, Yakuza Kyodai...) để lọc theo boss đã quét thấy thực tế.</p>
+      <input type="text" id="searchInput" placeholder="Tìm theo JobID / Gang / tên Boss, hoặc gõ /rift, /boss..." oninput="onSearchInput()">
       <div class="search-hint" id="searchHint" style="display:none"></div>
       <div class="actions" style="margin-top:14px">
         <button class="btn-danger" onclick="clearData()">🧹 Clear Data</button>
@@ -1257,11 +1259,16 @@ function renderLesterDashboard(key) {
       emptyHint.style.display = "none";
       let matchedCount = 0;
       body.innerHTML = list.map(s => {
-        const isMatched = !!(s.matchedPlayer || s.matchedGang);
+        const isMatched = !!(s.matchedPlayer || s.matchedGang || s.matchedBoss);
         if (isMatched) matchedCount++;
         let tags = "";
         if (s.matchedPlayer) tags += '<span class="tag tag-player">👤 ' + escapeHtml(s.matchedPlayer) + '</span> ';
-        if (s.matchedGang)   tags += '<span class="tag tag-gang">🏴 ' + escapeHtml(s.matchedGang) + '</span>';
+        if (s.matchedGang)   tags += '<span class="tag tag-gang">🏴 ' + escapeHtml(s.matchedGang) + '</span> ';
+        if (s.matchedBoss) {
+          const isSuper = s.bossType === "super";
+          tags += '<span class="tag ' + (isSuper ? "tag-boss-super" : "tag-boss-normal") + '">'
+            + (isSuper ? "👹 SUPER BOSS: " : "☠️ BOSS: ") + escapeHtml(s.matchedBoss) + '</span>';
+        }
         if (!tags) tags = '<span style="color:#555">—</span>';
         const timeDisplay = s.currentAgeStr ? s.currentAgeStr : fmtRealtime(s);
         return '<tr class="' + (isMatched ? "matched" : "") + '" data-jobid="' + escapeHtml(s.jobId) + '">'
@@ -1323,7 +1330,9 @@ function renderLesterDashboard(key) {
       const q = document.getElementById("searchInput").value.trim().toLowerCase();
       if (!q) { renderTable(list); return; }
       const filtered = list.filter(s =>
-        (s.jobId || "").toLowerCase().includes(q) || (s.gang || "").toLowerCase().includes(q)
+        (s.jobId || "").toLowerCase().includes(q) ||
+        (s.gang || "").toLowerCase().includes(q) ||
+        (s.matchedBoss || "").toLowerCase().includes(q)
       );
       renderTable(filtered);
     }
@@ -1380,7 +1389,9 @@ function renderLesterDashboard(key) {
       currentAlert = next ? next.server : null;
       const banner = document.getElementById("alertBanner");
       if (!currentAlert) { banner.style.display = "none"; stopAlarm(); return; }
-      const label = currentAlert.matchedPlayer ? "👤 " + currentAlert.matchedPlayer : "🏴 " + currentAlert.matchedGang;
+      const label = currentAlert.matchedPlayer ? "👤 " + currentAlert.matchedPlayer
+        : currentAlert.matchedGang ? "🏴 " + currentAlert.matchedGang
+        : (currentAlert.bossType === "super" ? "👹 SUPER BOSS: " : "☠️ BOSS: ") + currentAlert.matchedBoss;
       document.getElementById("alertTitle").textContent = "🚨 PHÁT HIỆN TARGET: " + label;
       document.getElementById("alertBody").textContent = "JobID: " + currentAlert.jobId + (alertQueue.length ? " — còn " + alertQueue.length + " cảnh báo khác đang chờ" : "");
       banner.style.display = "block";
@@ -1457,12 +1468,13 @@ app.post("/lester/join", apiAuth, (req, res) => {
 // ─── Báo cáo dữ liệu quét mỗi server (jobId, tuổi server, gang đang chiếm) ───
 // Quét lại cùng 1 jobId sẽ CẬP NHẬT record cũ (upsert theo jobId) chứ không tạo bản ghi mới.
 app.post("/lester/report", apiAuth, (req, res) => {
-  const { jobId, ageMinutes, gang } = req.body;
+  const { jobId, ageMinutes, gang, boss, bossType } = req.body;
   if (!jobId || typeof ageMinutes !== "number") {
-    return res.status(400).json({ error: 'Body phải có dạng: { jobId, ageMinutes, gang? }' });
+    return res.status(400).json({ error: 'Body phải có dạng: { jobId, ageMinutes, gang?, boss?, bossType? }' });
   }
   const now = new Date().toISOString();
   const existing = lesterServers[jobId] || {};
+  const hasBoss = boss !== undefined && boss !== null && boss !== "";
   lesterServers[jobId] = {
     ...existing,
     jobId,
@@ -1472,23 +1484,26 @@ app.post("/lester/report", apiAuth, (req, res) => {
     gang: (gang !== undefined && gang !== null && gang !== "") ? gang : (existing.gang || null),
     matchedPlayer: existing.matchedPlayer || null,
     matchedGang: existing.matchedGang || null,
+    matchedBoss: hasBoss ? boss : (existing.matchedBoss || null),
+    bossType: hasBoss ? (bossType || null) : (existing.bossType || null),
     joinScript: buildJoinScript(jobId),
   };
-  console.log(`[LESTER REPORT] jobId=${jobId} age=${lesterFmtMinutes(ageMinutes)} gang=${gang || "-"}`);
+  console.log(`[LESTER REPORT] jobId=${jobId} age=${lesterFmtMinutes(ageMinutes)} gang=${gang || "-"} boss=${boss || "-"}`);
   lesterBroadcast({ type: "report", server: lesterServers[jobId] });
   res.json({ success: true });
 });
 
-// ─── Báo cáo khớp target (player hoặc gang) -> dashboard sẽ rung chuông ─────
+// ─── Báo cáo khớp target (player, gang, hoặc boss) -> dashboard sẽ rung chuông ─
 app.post("/lester/report-find", apiAuth, (req, res) => {
-  const { type, name, jobId } = req.body;
+  const { type, name, jobId, bossType } = req.body;
   if (!jobId || !type || !name) {
-    return res.status(400).json({ error: 'Body phải có dạng: { type: "player"|"gang", name, jobId }' });
+    return res.status(400).json({ error: 'Body phải có dạng: { type: "player"|"gang"|"boss", name, jobId, bossType? }' });
   }
   const now = new Date().toISOString();
   const existing = lesterServers[jobId] || { jobId, ageMinutes: 0, reportedAt: now, joinScript: buildJoinScript(jobId) };
   if (type === "player") existing.matchedPlayer = name;
   if (type === "gang")   { existing.matchedGang = name; existing.gang = name; }
+  if (type === "boss")   { existing.matchedBoss = name; existing.bossType = bossType || existing.bossType || null; }
   existing.updatedAt = now;
   lesterServers[jobId] = existing;
   console.log(`[LESTER FIND] ${type} "${name}" @ ${jobId}`);
