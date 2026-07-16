@@ -100,7 +100,7 @@ let lesterTargetPlayers = lesterInit.targetPlayers; // tên player cần theo d�
 // Không còn round-robin/full-set riêng cho Lester nữa vì hopping giờ dùng
 // chung engine /claim + /skip đã có sẵn của Merchant Scanner.
 let lesterJoinQueue     = [];
-let lesterServers       = {};         // jobId -> { jobId, gang, ageMinutes, reportedAt, matchedPlayer, matchedGang, updatedAt } (RAM only, dùng nút Clear Data để dọn)
+let lesterServers       = {};         // jobId -> { jobId, gang, ageMinutes, reportedAt, matchedPlayers[], matchedGang, bosses[], updatedAt } (RAM only, dùng nút Clear Data để dọn)
 const lesterSseClients  = new Set();
 
 console.log(`📂 [LESTER LOAD] targetPlayers=${lesterTargetPlayers.length}`);
@@ -1259,15 +1259,19 @@ function renderLesterDashboard(key) {
       emptyHint.style.display = "none";
       let matchedCount = 0;
       body.innerHTML = list.map(s => {
-        const isMatched = !!(s.matchedPlayer || s.matchedGang || s.matchedBoss);
+        const players = Array.isArray(s.matchedPlayers) ? s.matchedPlayers : [];
+        const bosses  = Array.isArray(s.bosses) ? s.bosses : [];
+        const isMatched = !!(players.length || s.matchedGang || bosses.length);
         if (isMatched) matchedCount++;
         let tags = "";
-        if (s.matchedPlayer) tags += '<span class="tag tag-player">👤 ' + escapeHtml(s.matchedPlayer) + '</span> ';
+        if (players.length) tags += '<span class="tag tag-player">👤 ' + players.map(escapeHtml).join(", ") + '</span> ';
         if (s.matchedGang)   tags += '<span class="tag tag-gang">🏴 ' + escapeHtml(s.matchedGang) + '</span> ';
-        if (s.matchedBoss) {
-          const isSuper = s.bossType === "super";
-          tags += '<span class="tag ' + (isSuper ? "tag-boss-super" : "tag-boss-normal") + '">'
-            + (isSuper ? "👹 SUPER BOSS: " : "☠️ BOSS: ") + escapeHtml(s.matchedBoss) + '</span>';
+        if (bosses.length) {
+          tags += bosses.map(b => {
+            const isSuper = b.type === "super";
+            return '<span class="tag ' + (isSuper ? "tag-boss-super" : "tag-boss-normal") + '">'
+              + (isSuper ? "👹 " : "☠️ ") + escapeHtml(b.name) + '</span>';
+          }).join(" ");
         }
         if (!tags) tags = '<span style="color:#555">—</span>';
         const timeDisplay = s.currentAgeStr ? s.currentAgeStr : fmtRealtime(s);
@@ -1332,7 +1336,8 @@ function renderLesterDashboard(key) {
       const filtered = list.filter(s =>
         (s.jobId || "").toLowerCase().includes(q) ||
         (s.gang || "").toLowerCase().includes(q) ||
-        (s.matchedBoss || "").toLowerCase().includes(q)
+        (Array.isArray(s.bosses) && s.bosses.some(b => (b.name || "").toLowerCase().includes(q))) ||
+        (Array.isArray(s.matchedPlayers) && s.matchedPlayers.some(p => (p || "").toLowerCase().includes(q)))
       );
       renderTable(filtered);
     }
@@ -1379,8 +1384,8 @@ function renderLesterDashboard(key) {
       if (isMuted) { stopAlarm(); btn.textContent = "🔔 Bật tiếng"; btn.classList.add("active"); showToast("🔇 Đã tắt tiếng chuông"); }
       else { btn.textContent = "🔇 Tắt tiếng"; btn.classList.remove("active"); if (currentAlert || alertQueue.length) startAlarm(); showToast("🔔 Đã bật lại tiếng chuông"); }
     }
-    function showAlert(server, findType) {
-      alertQueue.push({ server, findType });
+    function showAlert(server, findType, label) {
+      alertQueue.push({ server, findType, label });
       if (!currentAlert) advanceAlert();
       startAlarm();
     }
@@ -1389,9 +1394,9 @@ function renderLesterDashboard(key) {
       currentAlert = next ? next.server : null;
       const banner = document.getElementById("alertBanner");
       if (!currentAlert) { banner.style.display = "none"; stopAlarm(); return; }
-      const label = currentAlert.matchedPlayer ? "👤 " + currentAlert.matchedPlayer
-        : currentAlert.matchedGang ? "🏴 " + currentAlert.matchedGang
-        : (currentAlert.bossType === "super" ? "👹 SUPER BOSS: " : "☠️ BOSS: ") + currentAlert.matchedBoss;
+      // Nhãn đã được server gộp sẵn (VD nhiều player: "👤 A, B" — nhiều boss:
+      // "☠️ Boss1, 👹 Boss2") -> chỉ 1 cảnh báo gọn dù khớp nhiều target cùng lúc.
+      const label = next.label || "—";
       document.getElementById("alertTitle").textContent = "🚨 PHÁT HIỆN TARGET: " + label;
       document.getElementById("alertBody").textContent = "JobID: " + currentAlert.jobId + (alertQueue.length ? " — còn " + alertQueue.length + " cảnh báo khác đang chờ" : "");
       banner.style.display = "block";
@@ -1410,7 +1415,7 @@ function renderLesterDashboard(key) {
         servers[ev.server.jobId] = ev.server;
         document.getElementById("stat-servers").textContent = Object.keys(servers).length;
         if (!searchMode) applyFilter();
-        if (ev.type === "find") showAlert(ev.server, ev.findType);
+        if (ev.type === "find") showAlert(ev.server, ev.findType, ev.label);
       };
     }
 
@@ -1468,13 +1473,16 @@ app.post("/lester/join", apiAuth, (req, res) => {
 // ─── Báo cáo dữ liệu quét mỗi server (jobId, tuổi server, gang đang chiếm) ───
 // Quét lại cùng 1 jobId sẽ CẬP NHẬT record cũ (upsert theo jobId) chứ không tạo bản ghi mới.
 app.post("/lester/report", apiAuth, (req, res) => {
-  const { jobId, ageMinutes, gang, boss, bossType } = req.body;
+  const { jobId, ageMinutes, gang, bosses } = req.body;
   if (!jobId || typeof ageMinutes !== "number") {
-    return res.status(400).json({ error: 'Body phải có dạng: { jobId, ageMinutes, gang?, boss?, bossType? }' });
+    return res.status(400).json({ error: 'Body phải có dạng: { jobId, ageMinutes, gang?, bosses? }' });
   }
   const now = new Date().toISOString();
   const existing = lesterServers[jobId] || {};
-  const hasBoss = boss !== undefined && boss !== null && boss !== "";
+  // bosses: [{ name, type }, ...] — có thể nhiều boss cùng lúc trong 1 jobId.
+  const bossList = Array.isArray(bosses)
+    ? bosses.filter((b) => b && b.name).map((b) => ({ name: String(b.name), type: b.type || null }))
+    : (existing.bosses || []);
   lesterServers[jobId] = {
     ...existing,
     jobId,
@@ -1482,32 +1490,53 @@ app.post("/lester/report", apiAuth, (req, res) => {
     reportedAt: now,
     updatedAt: now,
     gang: (gang !== undefined && gang !== null && gang !== "") ? gang : (existing.gang || null),
-    matchedPlayer: existing.matchedPlayer || null,
+    matchedPlayers: existing.matchedPlayers || [],
     matchedGang: existing.matchedGang || null,
-    matchedBoss: hasBoss ? boss : (existing.matchedBoss || null),
-    bossType: hasBoss ? (bossType || null) : (existing.bossType || null),
+    bosses: bossList,
     joinScript: buildJoinScript(jobId),
   };
-  console.log(`[LESTER REPORT] jobId=${jobId} age=${lesterFmtMinutes(ageMinutes)} gang=${gang || "-"} boss=${boss || "-"}`);
+  console.log(`[LESTER REPORT] jobId=${jobId} age=${lesterFmtMinutes(ageMinutes)} gang=${gang || "-"} bosses=${bossList.map((b) => b.name).join(", ") || "-"}`);
   lesterBroadcast({ type: "report", server: lesterServers[jobId] });
   res.json({ success: true });
 });
 
-// ─── Báo cáo khớp target (player, gang, hoặc boss) -> dashboard sẽ rung chuông ─
+// ─── Báo cáo khớp target (player, gang, hoặc boss) -> dashboard rung chuông ──
+// Gộp TOÀN BỘ player/boss khớp trong 1 jobId thành đúng 1 record + 1 dòng
+// cảnh báo gọn (label), thay vì bắn lẻ từng cái khi có nhiều target cùng lúc.
+//   type=player -> body: { jobId, players: ["a","b",...] }
+//   type=gang   -> body: { jobId, name: "Tên gang" }
+//   type=boss   -> body: { jobId, bosses: [{ name, type }, ...] }
 app.post("/lester/report-find", apiAuth, (req, res) => {
-  const { type, name, jobId, bossType } = req.body;
-  if (!jobId || !type || !name) {
-    return res.status(400).json({ error: 'Body phải có dạng: { type: "player"|"gang"|"boss", name, jobId, bossType? }' });
+  const { type, jobId, players, name, bosses } = req.body;
+  if (!jobId || !type) {
+    return res.status(400).json({ error: 'Body phải có dạng: { type: "player"|"gang"|"boss", jobId, players?|name?|bosses? }' });
   }
   const now = new Date().toISOString();
-  const existing = lesterServers[jobId] || { jobId, ageMinutes: 0, reportedAt: now, joinScript: buildJoinScript(jobId) };
-  if (type === "player") existing.matchedPlayer = name;
-  if (type === "gang")   { existing.matchedGang = name; existing.gang = name; }
-  if (type === "boss")   { existing.matchedBoss = name; existing.bossType = bossType || existing.bossType || null; }
+  const existing = lesterServers[jobId] || {
+    jobId, ageMinutes: 0, reportedAt: now,
+    matchedPlayers: [], matchedGang: null, bosses: [],
+    joinScript: buildJoinScript(jobId),
+  };
+
+  let label = "";
+  if (type === "player" && Array.isArray(players) && players.length) {
+    existing.matchedPlayers = [...new Set(players.map(String))];
+    label = "👤 " + existing.matchedPlayers.join(", ");
+  } else if (type === "gang" && name) {
+    existing.matchedGang = name;
+    existing.gang = name;
+    label = "🏴 " + name;
+  } else if (type === "boss" && Array.isArray(bosses) && bosses.length) {
+    existing.bosses = bosses.filter((b) => b && b.name).map((b) => ({ name: String(b.name), type: b.type || null }));
+    label = existing.bosses.map((b) => (b.type === "super" ? "👹 " : "☠️ ") + b.name).join(", ");
+  } else {
+    return res.status(400).json({ error: "Thiếu dữ liệu khớp phù hợp với type" });
+  }
+
   existing.updatedAt = now;
   lesterServers[jobId] = existing;
-  console.log(`[LESTER FIND] ${type} "${name}" @ ${jobId}`);
-  lesterBroadcast({ type: "find", findType: type, server: existing });
+  console.log(`[LESTER FIND] ${type} @ ${jobId}: ${label}`);
+  lesterBroadcast({ type: "find", findType: type, label, server: existing });
   res.json({ success: true });
 });
 
